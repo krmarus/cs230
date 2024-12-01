@@ -1,0 +1,15 @@
+windows:
+  - "soft"
+num_blocks: 4
+BATCH_SIZE: 10
+BUFFER_SIZE: 64
+start_from_epoch: 1800
+Patience: 300
+n_filters: 32
+
+Run_EPOCHS: 2000
+INITIAL_EPOCH: 0
+LOAD_PREV_WEIGHTS: False
+# PREV_MODEL_FILE: "best_model_dice.keras"
+SAVE_MODEL_FILE: "best_model_dice.keras"
+Loss_Function: dice_coef_multilabel #signed_distance_multilabel
