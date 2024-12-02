@@ -5,9 +5,8 @@ import numpy as np
 import keras
 import argparse
 
-from typing import List#, Union
+from typing import List
 import pydicom
-import cv2
 
 from keras.layers import Input
 from keras.layers import Conv2D
@@ -17,21 +16,21 @@ from keras.layers import BatchNormalization
 from keras.layers import Conv2DTranspose
 from keras.layers import concatenate
 
-from keras.models import load_model
-from keras.models import model_from_json
+# from keras.models import load_model
+# from keras.models import model_from_json
 
 from keras.callbacks import EarlyStopping
 from keras.callbacks import ModelCheckpoint
-from keras.callbacks import TensorBoard
+# from keras.callbacks import TensorBoard
 
-import numpy as np # linear algebra
+import numpy as np 
 from  scipy import ndimage
 import datetime
 import yaml
 
 
 ## Model Architecture
-def conv_block(inputs=None, n_filters=32, dropout_prob=0.3, max_pooling=True): #Add trainability setting?
+def conv_block(inputs=None, n_filters=32, dropout_prob=0.3, max_pooling=True):
     """
     Convolutional downsampling block
     
@@ -116,7 +115,18 @@ def upsampling_block(expansive_input, contractive_input, n_filters=32, dropout_p
 
     return conv
 
-def build_model(input_shape=(512,512,3),n_filters=32, n_classes=9,n_blocks=6): ## Maybe include kernel size?
+def build_model(input_shape=(512,512,3),n_filters=32, n_classes=9,n_blocks=6):
+    """
+    Build U-Net Model
+    
+    Arguments:
+        inputs_shape -- Tuple of input dimensions
+        n_filters -- Number of filters for the first convolutional layer
+        n_classes -- Number of output classes (muscle subgroups + background)
+        n_blocks -- Number of cblocks, number of ublocks
+    Returns: 
+        model --  Keras model with He random initialization of layers
+    """
     inputs = Input(input_shape)
     cblocks = {}
     ublocks = {}
@@ -142,7 +152,7 @@ def build_model(input_shape=(512,512,3),n_filters=32, n_classes=9,n_blocks=6): #
     
     return model
 
-## Function from Comp2Comp 
+## Function Modified from Comp2Comp, Blankemeier et al 2023 ## 
 def parse_windows(windows):
     """Parse windows provided by the user.
 
@@ -162,12 +172,9 @@ def parse_windows(windows):
         "spine": (250, 50),
         "custom": (500, 50),
     }
-    # print(windows)
     vals = []
     for w in windows:
-        # print(w)
         w=w.decode('utf-8')
-        # print(w)
         if len(w) == 2:
             assert_msg = "Expected tuple of (lower, upper) bound"
             assert len(w) == 2, assert_msg
@@ -189,24 +196,23 @@ def parse_windows(windows):
     return tuple(vals)
 
 ## Apply Windowing to CT Images, Stack Images
-
+## Function Modified from Comp2Comp, Blankemeier et al 2023 ## 
 def _window(xs, c2c_mask, bounds):
     """Apply windowing to an array of CT images.
 
     Args:
-        xs (ndarray): NxHxW
-        mask (ndarray): NxHxW
+        xs (ndarray): NxHxW, CT image
+        c2c_mask (ndarray): NxHxW, Muscle Mask, Output from Comp2Comp, no windowing applied
         bounds (tuple): (lower, upper) bounds
 
     Returns:
-        ndarray: Windowed images.
+        ndarray: Stack of Muscle Mask and Windowed images.
     """
 
     imgs = []
-    imgs.append(c2c_mask) #/ 255) # Normalize mask input from 0 to 1
+    imgs.append(c2c_mask)
     for lb, ub in bounds:
         imgs.append(np.clip(xs, a_min=lb, a_max=ub))
-    # print(len(imgs))
     if len(imgs) == 1:
         return np.expand_dims(imgs[0],axis=-1)
     elif xs.shape[-1] == 1:
@@ -215,89 +221,196 @@ def _window(xs, c2c_mask, bounds):
         return np.stack(imgs, axis=-1)
 
 def create_mask(pred_mask):
+    """Create mask from model output. For result visualization
+
+    Args:
+        pred_mask (ndarray): HxWxN_Classes
+
+    Returns:
+        pred_mask (ndarray): HxW, Softmax output
+    """
     pred_mask = tf.argmax(pred_mask, axis=-1)
     pred_mask = pred_mask[..., tf.newaxis]
-    return pred_mask#[0]
+    return pred_mask
 
 ## Data Preprocessing ## 
 def process_path_C2C(image_path, c2c_mask_path, mask_path):
+    """Read input (CT image, Muscle Mask) and label (Muscle Subgroup Mask) DICOM files as arrays
+
+    Args:
+        image_path: Path to CT image DICOM file (model input)
+        c2c_mask_path: Path to Muscle Mask DICOM file (model input)
+        mask_path: Path to Labeled Mask DICOM file (model labels)
+
+    Returns:
+        img, c2c_mask, mask:  (512, 512) ndarrays, type float32
+    """
     image_path = image_path.numpy().decode("utf-8")
     c2c_mask_path = c2c_mask_path.numpy().decode("utf-8")
     mask_path = mask_path.numpy().decode("utf-8")
+    
+    # Read in CT image, Muscle Mask, Labeled Mask DICOMS as pixel arrays ##
     img = pydicom.read_file(image_path, force=True)
     img = (img.pixel_array + int(img.RescaleIntercept)).astype("float32")
+    
     c2c_mask = pydicom.read_file(c2c_mask_path, force=True)
     c2c_mask = (c2c_mask.pixel_array).astype("float32")
+    
     mask = pydicom.read_file(mask_path, force=True)
     mask = (mask.pixel_array + int(mask.RescaleIntercept)).astype("float32")
 
     return img, c2c_mask, mask
 
 def tf_process_path_C2C(image_path, c2c_mask_path, mask_path):
+    """Read all input and label DICOM files in tf dataset, store as arrays """
+
     return tf.py_function(process_path_C2C, [image_path, c2c_mask_path, mask_path], [tf.float32, tf.float32, tf.float32])
 
-def preprocess_C2C(image, c2c_mask, mask, windows):#=['soft','bone','custom']):
+def preprocess_C2C(image, c2c_mask, mask, windows):
+    """Apply windows to CT image, stack with Muscle Mask
     
-    # windows = tf.py_function(parse_windows,[windows],[tf.float32])
-    # print(windows.numpy().tolist())
+    Args:
+        image:      ndarray CT image pixel array
+        c2c_mask:   ndarray muscle mask pixel array
+        mask:       ndarray true, labeled pixel array
+        windows:    list of window/level settings to apply to CT image
+        
+    
+    Returns:
+        window_imags:   ndarray, stacked c2c_mask and windowed CT image(s)
+        mask:       ndarray true, labeled pixel array (unmodified)
+        """
+        
     window_imgs = _window(image, c2c_mask, parse_windows(windows.numpy().tolist()))
     return window_imgs, mask
 
 def tf_preprocess_C2C(image, c2c_mask, mask, windows):
-    # print(windows)
+    """Apply windows to CT image, stack with Muscle Mask for all examples in tf dataset"""
     return tf.py_function(preprocess_C2C, [image, c2c_mask, mask, windows], [tf.float32, tf.float32])
 
-## Loss Function ##
-# from keras import backend as K
+## Loss Functions ##
 def dice_coef(y_true, y_pred):
-    smooth = 1e-6
+    """Calculate Dice Coefficient for Single Class
+    
+    Args:
+        y_true:      binary ground truth labeled mask for single class
+        y_pred:      binary model output mask for single class
+    
+    Returns:
+        dice_coefficent: (2* intersection of true and predicted masks)/(total number of class pixels in true and predicted masks)
+        """
+        
+    smooth = 1e-6   # Arbitrary small value, prevent division by 0
     y_true_f = tf.keras.backend.flatten(y_true)
     y_pred_f = tf.keras.backend.flatten(y_pred)
-    intersection = tf.keras.backend.sum(y_true_f * y_pred_f)
+    intersection = tf.keras.backend.sum(y_true_f * y_pred_f) #Calculate overlap of correctly labeled pixels
+    
     return (2. * intersection + smooth) / (tf.keras.backend.sum(y_true_f) + tf.keras.backend.sum(y_pred_f) + smooth)
 
 def dice_coef_multilabel(y_true, y_pred, numLabels=9):
+    """Calculate Multilabel, Weighted Dice Coefficient for All Classes
+    
+    Args:
+        y_true:             (NxHxW) ground truth labeled mask for all classes
+        y_pred:             (NxHxWxnumLabels) ndarray muscle mask pixel array
+        numLabels (float):  number of output classes from model
+    
+    Vars:
+        weight:     number of pixels for class in true class
+    Returns:
+        dice (float):   
+        """
     dice=0
     y_true_one_hot =  tf.one_hot(tf.cast(y_true,tf.uint8), depth=numLabels, axis=-1)
+    
     for index in range(numLabels):
-        # dice -= dice_coef(y_true_one_hot[:,:,:,index], y_pred[:,:,:,index])
-        weight = 1/ tf.keras.backend.sum(tf.keras.backend.flatten(y_true_one_hot[:,:,:,index]))
+        weight = 1/ tf.keras.backend.sum(tf.keras.backend.flatten(y_true_one_hot[:,:,:,index])) 
         dice -= weight * dice_coef(y_true_one_hot[:,:,:,index], y_pred[:,:,:,index])
-    # for index in range(numLabels-1):
-    #     dice -= dice_coef(y_true_one_hot[:,:,:,index], y_pred[:,:,:,index])
-    #     # weight = 1/ tf.keras.backend.sum(tf.keras.backend.flatten(y_true_one_hot[:,:,:,index+1]))
-    #     # dice -= weight * dice_coef(y_true_one_hot[:,:,:,index+1], y_pred[:,:,:,index+1])
-        
+
     return dice
 
 def distance_transform_edt_tf(tensor):
+    """Apply ndimage Euclidean Distance Transform to Tensor
+    
+    Args:
+        tensor:     binary mask for single class
+    
+    Returns:
+        result:     ndimage Euclidean Distance Transform for tensor pixels with value 1
+        """
     def numpy_distance_transform(input_array):
         return ndimage.distance_transform_edt(input_array).astype(np.float32)
     
     # Use tf.py_function to apply the numpy function
     result = tf.py_function(numpy_distance_transform, [tensor], tf.float32)
-    # Ensure shape propagation
     result.set_shape(tensor.shape)
     return result
     
 def signed_dist_map(y_true):
+    """Calculate Euclidean Distance Map for pixels outside single class
+    
+    Args:
+        y_true:     binary ground truth labeled mask for single class
+    
+    Returns:
+        map:        Calculate Euclidean Distance of other class pixels, 
+                        Apply distance weighting penalty: Distance map to a power (0.5)
+        """
     return tf.keras.backend.pow(distance_transform_edt_tf(1 - y_true), 1/2)
 
 def signed_dist_map_x2_x05(y_true):
+    """Calculate Euclidean Distance Map for pixels outside single class
+    
+    Args:
+        y_true:     binary ground truth labeled mask for single class
+    
+    Returns:
+        map:        Calculate Euclidean Distance of other class pixels, 
+                        Apply distance weighting penalty: 
+                            Distance map to a power (0.5) + Distance map squared
+        """
+        
     map = distance_transform_edt_tf(1 - y_true)
     return tf.keras.backend.pow(map, 2) + tf.keras.backend.pow(map,0.5)
 
 def signed_dist_map_2x(y_true):
+    """Calculate Euclidean Distance Map for pixels outside single class
+    
+    Args:
+        y_true:     binary ground truth labeled mask for single class
+    
+    Returns:
+        map:        Calculate Euclidean Distance of other class pixels, 
+                        Apply linear distance weighting penalty: 
+                            2*Distance map
+        """
     return 2*distance_transform_edt_tf(1 - y_true)
 
 
 def signed_distance(y_true, y_pred,map):
-
+    """Calculate Signed Distance Penalty for pixels outside single class
+    
+    Args:
+        y_true:     binary ground truth labeled mask for alls output class
+    
+    Returns:
+        signed_distance (float):     signed distance of pixels incorrectly labeled as this class
+        """
     y_true_f = 1 + tf.keras.backend.flatten(map(y_true))
     y_pred_f = tf.keras.backend.flatten(y_pred)
     return tf.keras.backend.sum(tf.cast(y_true_f,tf.float32) * y_pred_f)
     
 def signed_distance_multilabel(y_true, y_pred, map_name,numLabels=9):
+    """Calculate Euclidean Distance Map for pixels outside single class
+    
+    Args:
+        y_true:     ground truth labeled mask for all classes
+    
+    Returns:
+        sign_dist_loss:   total signed distance loss penalty for incorrectly labeled pixels in all classes, 
+                                individual class penalties weighted based on number of pixels in the true mask
+        """
+        
     map_functions = {
     "signed_dist_map": signed_dist_map,
     "signed_dist_map_x2_x05": signed_dist_map_x2_x05,
@@ -306,24 +419,54 @@ def signed_distance_multilabel(y_true, y_pred, map_name,numLabels=9):
     
     sign_dist_loss = 0
     y_true_one_hot =  tf.one_hot(tf.cast(y_true,tf.uint8), depth=numLabels, axis=-1)
-    for index in range(numLabels):#range(numLabels-1):
-        weight = 1/ tf.keras.backend.sum(tf.keras.backend.flatten(y_true_one_hot[:,:,:,index]))#tf.keras.backend.sum(tf.keras.backend.flatten(y_true_one_hot[:,:,:,index+1]))
-        # print(y_true_one_hot[:,:,:,index+1].shape)
-        # print(y_pred[:,:,:,index+1].shape)
-        sign_dist_loss += weight * signed_distance(y_true_one_hot[:,:,:,index], y_pred[:,:,:,index],map_functions[map_name])#signed_distance(y_true_one_hot[:,:,:,index+1], y_pred[:,:,:,index+1])#signed_distance(y_true_one_hot[:,:,:,index+1], y_pred[:,:,:,index+1])
+    for index in range(numLabels):
+        weight = 1/ tf.keras.backend.sum(tf.keras.backend.flatten(y_true_one_hot[:,:,:,index]))
+        sign_dist_loss += weight * signed_distance(y_true_one_hot[:,:,:,index], y_pred[:,:,:,index],map_functions[map_name])
     
     return sign_dist_loss
 
+
 def dice_dist_multilabel(y_true, y_pred, numLabels=9):
+    """Loss Function combining Dice Coefficient and Linear Signed Distance Maps
+    
+    Args:
+        y_true:     ground truth labeled masks for all classes
+    
+    Returns:
+        dice_dist_loss: loss for dataset batch   
+        """
+       
     return signed_distance_multilabel(y_true, y_pred,"signed_dist_map",numLabels,) + (1e7)*dice_coef_multilabel(y_true, y_pred, numLabels)
 
 def dice_dist_multilabel_2x(y_true, y_pred, numLabels=9):
+    """Loss Function combining Dice Coefficient and 2*Linear Signed Distance Maps
+    
+    Args:
+        y_true:     ground truth labeled masks for all classes
+    
+    Returns:
+        dice_dist_loss:   loss for dataset batch
+        """
+       
     return signed_distance_multilabel(y_true, y_pred, "signed_dist_map_2x",numLabels) + (1e7)*dice_coef_multilabel(y_true, y_pred, numLabels)
 
 def dice_dist_multilabel_x2_x05(y_true, y_pred, numLabels=9):
+    """Loss Function combining Dice Coefficient and Non-Linear Signed Distance Maps
+    
+    Args:
+        y_true:     ground truth labeled masks for all classes
+    
+    Returns:
+        dice_dist_loss:   loss for dataset batch
+        
+        """
+       
     return signed_distance_multilabel(y_true, y_pred,"signed_dist_map_x2_x05", numLabels) + (1e6)*dice_coef_multilabel(y_true, y_pred, numLabels)
 
-# Map function names to implementations
+
+
+
+# Map function names in config file to to implementations
 custom_functions = {
     "signed_distance_multilabel": signed_distance_multilabel,
     "dice_dist_multilabel_x2_x05": dice_dist_multilabel_x2_x05,
@@ -331,10 +474,9 @@ custom_functions = {
 
     "dice_coef_multilabel": dice_coef_multilabel,
     "dice_dist_multilabel": dice_dist_multilabel
-
-    # Add other custom functions here if needed
 }
 
+# File Names of CT Images #
 image_list = ['./inputs/AC42132bb-AC4213690-CT.dcm',
     './inputs/AC42132bc-AC42164ba-CT.dcm',
     './inputs/AC4213342-AC4213717-CT.dcm',
@@ -535,6 +677,7 @@ image_list = ['./inputs/AC42132bb-AC4213690-CT.dcm',
     './inputs/AC4244aed-AC4244e7a-CT.dcm',
 ]
 
+# File Names of Comp2Comp Muscle Masks #
 c2c_mask_list = ['./c2c_masks/AC42132bb-AC4213690-mask.dcm',
     './c2c_masks/AC42132bc-AC42164ba-mask.dcm',
     './c2c_masks/AC4213342-AC4213717-mask.dcm',
@@ -735,6 +878,7 @@ c2c_mask_list = ['./c2c_masks/AC42132bb-AC4213690-mask.dcm',
     './c2c_masks/AC4244aed-AC4244e7a-mask.dcm'
 ]
 
+# File Names of Labeled Muscle Subgroups #
 mask_list = ['./labels/AC42132bb-AC4213690.dcm',
     './labels/AC42132bc-AC42164ba.dcm',
     './labels/AC4213342-AC4213717.dcm',
@@ -935,15 +1079,16 @@ mask_list = ['./labels/AC42132bb-AC4213690.dcm',
     './labels/AC4244aed-AC4244e7a.dcm',
 ]
 
+
 # Set up argument parser
 parser = argparse.ArgumentParser(description="Load configuration from a file.")
 parser.add_argument("config", type=str, help="Path to the configuration file")
 
-# Parse arguments
+# Parse commandline arguments
 args = parser.parse_args()
 config_file = args.config
 
-# Load the YAML configuration file
+# Load the specified YAML configuration file #
 try:
     with open(config_file, "r") as file:
         config = yaml.safe_load(file)
@@ -951,16 +1096,17 @@ except FileNotFoundError:
     print(f"Error: Configuration file '{config_file}' not found.")
     exit(1)
     
-######### START HERE #############
+######### MODEL SETUP STARTS HERE #############
     
-## Set Input Windows
+## Set Input Windows from Config File
 windows = config["windows"]
 
+# Build Model #
 input_shape = (512,512,len(windows)+1)
 model_test = build_model(input_shape=input_shape,n_blocks=config["num_blocks"],n_classes=9)
 model_test.summary()
 
-## Create Tensorflow Datasets
+## Create Tensorflow Datasets ##
 image_list_ds = tf.data.Dataset.list_files(image_list, shuffle=False)
 c2c_list_ds = tf.data.Dataset.list_files(c2c_mask_list, shuffle=False)
 mask_list_ds = tf.data.Dataset.list_files(mask_list, shuffle=False)
@@ -971,31 +1117,33 @@ masks_filenames = tf.constant(mask_list)
 
 dataset = tf.data.Dataset.from_tensor_slices((image_filenames, c2c_maks_filenames,masks_filenames))
 
-# Apply the function to the dataset
+## Read Image Dataset as Arrays ##
 image_ds = dataset.map(tf_process_path_C2C).map(
       lambda img, c2c_mask, mask: (tf.ensure_shape(img, (512,512)), tf.ensure_shape(c2c_mask,(512,512)), tf.ensure_shape(mask, (512,512)))
  )
-## Edit 3rd dim of img
+## Preprocess Images: Windowing & Stacking ##
 processed_image_ds = image_ds.map(lambda image, c2c_mask, mask: tf_preprocess_C2C(image, c2c_mask, mask, windows)).map(
      lambda img, mask: (tf.ensure_shape(img, (512,512,len(windows)+1)), tf.ensure_shape(mask, (512,512))))
 
 
+## Set Model Optimizer ##
 opt = keras.optimizers.Adam(learning_rate=0.001, beta_1=0.9, beta_2=0.999, epsilon=1e-07)
 
-if config["LOAD_PREV_WEIGHTS"]:
+
+if config["LOAD_PREV_WEIGHTS"]: # If config file has previous weights to load (e.g. continue training)
     model_test.load_weights('model_test.weights.h5', skip_mismatch=False)
 
 model_test.compile(
     optimizer=opt,
-    loss=custom_functions[config["Loss_Function"]],#dice_coef_multilabel, ## Define Loss Function
-    metrics=['accuracy']    # Metrics
+    loss=custom_functions[config["Loss_Function"]],
+    metrics=['accuracy']
 )
 
 
-initial_epoch=config["INITIAL_EPOCH"]
-EPOCHS=initial_epoch+config["Run_EPOCHS"]
-BUFFER_SIZE = config["BUFFER_SIZE"]
-BATCH_SIZE = config["BATCH_SIZE"]
+initial_epoch=config["INITIAL_EPOCH"]       # Set initial_epoch for logs
+EPOCHS=initial_epoch+config["Run_EPOCHS"]   # Set number of epochs to run
+BUFFER_SIZE = config["BUFFER_SIZE"]         # Set Buffer Size
+BATCH_SIZE = config["BATCH_SIZE"]           # Set Batch Size
 
 # Split Datasets 80/10/10
 processed_img_ds_train, processed_image_ds_valtest = keras.utils.split_dataset(processed_image_ds, left_size=0.8)
@@ -1004,6 +1152,7 @@ processed_image_ds_val, processed_image_ds_test = keras.utils.split_dataset(proc
 train_dataset = processed_img_ds_train.cache().shuffle(BUFFER_SIZE).batch(BATCH_SIZE).prefetch(buffer_size=BUFFER_SIZE)
 val_dataset = processed_image_ds_val.cache().shuffle(BUFFER_SIZE).batch(BATCH_SIZE).prefetch(buffer_size=BUFFER_SIZE)
 
+# Set output log directory
 log_dir = "logs/fit/" + datetime.datetime.now().strftime("%Y-%m-%d-%H:%M:%S")
 tensorboard_callback = keras.callbacks.TensorBoard(log_dir=log_dir)
 
@@ -1013,4 +1162,5 @@ callbacks = [
   tensorboard_callback
 ]
 
+# Train model
 model_history = model_test.fit(train_dataset, epochs=EPOCHS,verbose=2,callbacks=[callbacks],validation_data=val_dataset, initial_epoch=initial_epoch)
